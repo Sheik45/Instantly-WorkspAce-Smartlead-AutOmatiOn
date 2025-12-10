@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""
+Instantly AI Gmail OAuth automation
+- Uses Chrome functions from smartlead.py
+- Reads from Google Sheet instead of CSV
+- Updates status via Apps Script
+"""
+
+import os
+import re
+import time
+import random
+import logging
+import requests
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+
+import pandas as pd
+import undetected_chromedriver as uc
+from seleniumbase import SB
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, NoSuchElementException
+
+# ============================= CONFIG =============================
+GOOGLE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1O36ayW0vyVUXgashqIXo14HxaBW-Vv5_F1we0NvXPd4/export?format=csv&gid=1725078243"
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwAvUplKn5c-yYDY_NHEbOCCAnZKIBUrg5gogQDq3tIaBqlzDg-C-zZIUqkMO5R-FHHWg/exec"
+INSTANTLY_URL = 'https://app.instantly.ai/app/accounts'
+
+# Typing delays - OPTIMIZED FOR SPEED
+FAST_DELAY = (0.01, 0.02)
+MEDIUM_DELAY = (0.03, 0.06)
+CLICK_DELAY = (0.1, 0.2)
+
+logging.basicConfig(
+    filename='instantly_automation.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Log environment at startup
+logging.info("="*60)
+logging.info("INSTANTLY AUTOMATION STARTING")
+logging.info(f"DISPLAY: {os.environ.get('DISPLAY', 'NOT SET')}")
+logging.info(f"PATH: {os.environ.get('PATH', 'NOT SET')[:200]}")
+logging.info(f"USER: {os.environ.get('USER', 'NOT SET')}")
+logging.info(f"HOME: {os.environ.get('HOME', 'NOT SET')}")
+logging.info(f"Working Directory: {os.getcwd()}")
+logging.info("="*60)
+
+# ============================= CHROME DRIVER (from smartlead.py) =============================
+def _create_driver_with_seleniumbase(headless, profile_dir):
+    """Launch Chrome via SeleniumBase in UC mode with incognito (PRIVATE MODE)."""
+    # Ensure DISPLAY is set for VM
+    if not os.environ.get('DISPLAY'):
+        os.environ['DISPLAY'] = ':0'
+    
+    sb_kwargs = dict(
+        browser="chrome",
+        incognito=True,  # PRIVATE/INCOGNITO MODE
+        uc=True,
+        uc_cdp_events=True,
+        locale="en-US",
+    )
+    if headless:
+        sb_kwargs["headless"] = True
+    else:
+        sb_kwargs["headed"] = True
+
+    sb_context = SB(**sb_kwargs)
+    browser = sb_context.__enter__()
+    driver = getattr(browser, "driver", None)
+    if not driver:
+        sb_context.__exit__(None, None, None)
+        raise RuntimeError("SeleniumBase driver handle missing")
+
+    driver.set_page_load_timeout(60)
+    driver.implicitly_wait(4)
+    try:
+        if not headless:
+            # Set window size for VM visibility
+            driver.set_window_size(1280, 720)
+            safe_sleep((0.5, 1.0))
+            try:
+                driver.maximize_window()
+                safe_sleep((0.5, 1.0))
+            except:
+                pass
+    except Exception:
+        pass
+
+    driver._sb_context = sb_context
+    driver._sb_browser = browser
+    logging.info(f"SeleniumBase UC Chrome started in INCOGNITO/PRIVATE mode")
+    return driver
+
+def _create_driver_with_raw_uc(headless, profile_dir):
+    """Fallback: direct undetected_chromedriver instance with incognito (PRIVATE MODE)."""
+    # Ensure DISPLAY is set for VM
+    if not os.environ.get('DISPLAY'):
+        os.environ['DISPLAY'] = ':0'
+    
+    arguments = [
+        "--incognito",  # PRIVATE/INCOGNITO MODE - ALWAYS ENABLED
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-plugins",
+        "--disable-images",
+        "--disable-javascript-harmony-shipping",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-breakpad",
+        "--disable-client-side-phishing-detection",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-domain-reliability",
+        "--disable-features=TranslateUI",
+        "--disable-hang-monitor",
+        "--disable-ipc-flooding-protection",
+        "--disable-notifications",
+        "--disable-popup-blocking",
+        "--disable-prompt-on-repost",
+        "--disable-renderer-backgrounding",
+        "--disable-sync",
+        "--disable-web-resources",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
+        "--force-color-profile=srgb",
+        "--metrics-recording-only",
+        "--no-first-run",
+        "--safebrowsing-disable-auto-update",
+        "--enable-automation",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--lang=en-US,en",
+    ]
+    if not headless:
+        arguments.append("--start-maximized")
+    else:
+        arguments.append("--headless=new")
+
+    uc_kwargs = dict(
+        use_subprocess=True,
+        arguments=arguments,
+        headless=headless,
+        version_main=142,
+    )
+
+    try:
+        driver = uc.Chrome(**uc_kwargs)
+    except Exception as e:
+        logging.warning(f"UC launch with version_main failed, retrying auto-detect: {e}")
+        try:
+            uc_kwargs.pop("version_main", None)
+            driver = uc.Chrome(**uc_kwargs)
+        except Exception as e2:
+            logging.warning(f"UC launch with auto-detect failed, trying minimal config: {e2}")
+            uc_kwargs_minimal = {
+                "use_subprocess": True,
+                "arguments": ["--no-sandbox", "--disable-dev-shm-usage", "--incognito", "--start-maximized", "--window-size=1280,720"],
+                "headless": headless,
+            }
+            driver = uc.Chrome(**uc_kwargs_minimal)
+
+    driver.set_page_load_timeout(60)
+    driver.implicitly_wait(4)
+    try:
+        if not headless:
+            # Set window size for VM visibility
+            driver.set_window_size(1280, 720)
+            safe_sleep((0.5, 1.0))
+            try:
+                driver.maximize_window()
+                safe_sleep((0.5, 1.0))
+            except:
+                pass
+    except Exception:
+        pass
+
+    # Advanced anti-detection scripts
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.navigator.chrome = {runtime: {}};
+                Object.defineProperty(navigator, 'permissions', {get: () => ({query: () => Promise.resolve({state: 'granted'})})});
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            """
+        })
+    except Exception as e:
+        logging.debug(f"Anti-detection script error: {e}")
+
+    logging.info(f"Fallback UC Chrome started in INCOGNITO/PRIVATE mode")
+    return driver
+
+def create_chrome_driver(headless=False, profile_dir=None, max_retries=3):
+    """Create Chrome driver with incognito mode and robust error handling."""
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            try:
+                driver = _create_driver_with_seleniumbase(headless, None)
+                try:
+                    _ = driver.current_url
+                    logging.info(f"Chrome driver created successfully (SeleniumBase, attempt {attempt + 1})")
+                    return driver
+                except:
+                    raise Exception("Driver created but not responsive")
+            except Exception as sb_error:
+                logging.warning(f"SeleniumBase UC launch failed (attempt {attempt + 1}): {sb_error}")
+                last_error = sb_error
+                try:
+                    if 'driver' in locals():
+                        shutdown_driver(driver)
+                except:
+                    pass
+            
+            try:
+                driver = _create_driver_with_raw_uc(headless, None)
+                try:
+                    _ = driver.current_url
+                    logging.info(f"Chrome driver created successfully (raw UC, attempt {attempt + 1})")
+                    return driver
+                except:
+                    raise Exception("Driver created but not responsive")
+            except Exception as uc_error:
+                logging.warning(f"Raw UC launch failed (attempt {attempt + 1}): {uc_error}")
+                last_error = uc_error
+                try:
+                    if 'driver' in locals():
+                        shutdown_driver(driver)
+                except:
+                    pass
+            
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                logging.info(f"Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+                
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 2)
+    
+    error_msg = f"Failed to create Chrome driver after {max_retries} attempts. Last error: {last_error}"
+    logging.error(error_msg)
+    raise Exception(error_msg)
+
+def shutdown_driver(driver):
+    """Gracefully close SeleniumBase or raw UC drivers."""
+    if not driver:
+        return
+    sb_context = getattr(driver, "_sb_context", None)
+    try:
+        if sb_context:
+            sb_context.__exit__(None, None, None)
+        else:
+            driver.quit()
+    except Exception:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+# ============================= HELPERS (from smartlead.py) =============================
+def safe_sleep(rng):
+    time.sleep(random.uniform(*rng))
+
+def type_slowly(element, text, driver=None, delay_range=FAST_DELAY):
+    """Human-like typing with JS fallback."""
+    if not text:
+        return
+    try:
+        try:
+            if driver:
+                driver.execute_script("arguments[0].focus();", element)
+            element.click()
+        except:
+            pass
+
+        try:
+            element.clear()
+        except:
+            try:
+                element.send_keys(Keys.CONTROL + "a", Keys.BACKSPACE)
+            except:
+                pass
+
+        safe_sleep((0.05, 0.1))
+        # Type in chunks of 5 characters for speed
+        chunk_size = 5
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i+chunk_size]
+            try:
+                element.send_keys(chunk)
+            except Exception:
+                if driver:
+                    try:
+                        cur = driver.execute_script("return arguments[0].value || '';", element)
+                        driver.execute_script("arguments[0].value = arguments[1];", element, cur + chunk)
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", element)
+                    except:
+                        pass
+            safe_sleep(delay_range)
+        safe_sleep((0.1, 0.2))
+    except Exception as e:
+        logging.warning(f"type_slowly error: {e}")
+
+def click_element_with_fallback(driver, by, selector, timeout=10, retries=3):
+    """Advanced click with multiple methods, retries, and human-like behavior."""
+    for attempt in range(retries):
+        try:
+            try:
+                _ = driver.current_url
+            except:
+                logging.error("Driver connection lost in click_element_with_fallback")
+                return False
+            
+            el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, selector)))
+            WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, selector)))
+            
+            try:
+                is_displayed = el.is_displayed()
+                if not is_displayed:
+                    if attempt < retries - 1:
+                        safe_sleep((0.5, 1.0))
+                    continue
+            except:
+                pass
+            
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                safe_sleep((0.1, 0.2))
+            except:
+                pass
+            
+            safe_sleep((0.1, 0.2))
+
+            click_success = False
+            # Try JS click first (fastest), then regular click
+            try:
+                driver.execute_script("arguments[0].click();", el)
+                safe_sleep((0.1, 0.2))
+                click_success = True
+            except:
+                try:
+                    el.click()
+                    safe_sleep((0.1, 0.2))
+                    click_success = True
+                except:
+                    pass
+            
+            if click_success:
+                return True
+            
+            if attempt < retries - 1:
+                safe_sleep((0.3, 0.5))
+                continue
+                
+        except Exception as e:
+            if attempt < retries - 1:
+                safe_sleep((0.8, 1.2))
+            continue
+    
+    return False
+
+def find_and_click_element(driver, xpaths, name, worker_id, timeout=4, use_js=True, retries=2):
+    """Find and click element using multiple xpaths with retries - FAST VERSION."""
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline and attempt <= retries:
+        for xp in xpaths:
+            try:
+                el = WebDriverWait(driver, 0.8).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                safe_sleep((0.05, 0.1))
+                driver.execute_script("arguments[0].click();", el)
+                logging.info(f"[{worker_id}] Clicked {name}")
+                return True
+            except:
+                continue
+        safe_sleep((0.2, 0.4))
+        attempt += 1
+    return False
+
+# ============================= STATUS UPDATE =============================
+def update_status(gemail, status, workspace_status=None, error_msg=""):
+    """Update status in Google Sheet via Apps Script with retries."""
+    max_retries = 3
+    retry_count = 0
+    
+    payload = {
+        "gmail_email": gemail,
+        "status": status,
+        "error_message": error_msg[:120] if error_msg else "",
+        "workspace_status": workspace_status or "",
+        "category": "instantly"
+    }
+    if status.lower() in ["done", "success"]:
+        payload["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    while retry_count < max_retries:
+        try:
+            response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=10)
+            if response.status_code == 200:
+                logging.info(f"✓ Status updated → {gemail}: {status} [workspace: {workspace_status}]")
+                return True
+            else:
+                logging.warning(f"Status update returned {response.status_code} for {gemail}: {response.text[:100]}")
+                if retry_count < max_retries - 1:
+                    retry_count += 1
+                    safe_sleep((1.0, 2.0))
+                    continue
+        except requests.exceptions.Timeout:
+            logging.warning(f"Status update timeout for {gemail} (attempt {retry_count + 1}/{max_retries})")
+            if retry_count < max_retries - 1:
+                retry_count += 1
+                safe_sleep((2.0, 3.0))
+                continue
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Status update error for {gemail} (attempt {retry_count + 1}/{max_retries}): {e}")
+            if retry_count < max_retries - 1:
+                retry_count += 1
+                safe_sleep((1.0, 2.0))
+                continue
+        except Exception as e:
+            logging.error(f"Unexpected error updating status for {gemail}: {e}")
+            break
+    
+    logging.error(f"✗ Failed to update status after {max_retries} attempts: {gemail}: {status}")
+    return False
+
+# ============================= MAIN FLOW =============================
+def process_single_account(gemail, gpassword, instantly_email, instantly_password, workspace, recovery_email, worker_id):
+    """Process a single account with robust error handling."""
+    driver = None
+    max_retries = 2
+    retry_count = 0
+    
+    # Initialize workspace_status to track throughout the process
+    workspace_status = "pending"
+    
+    # ========== ONE-TIME SETUP: Open Chrome and Navigate (ONLY ONCE) ==========
+    try:
+        # Set sheet status to Processing at start
+        update_status(gemail, "Processing", workspace_status, "Opening Chrome in PRIVATE/INCOGNITO mode...")
+        print(f"[{worker_id}] Opening Chrome in INCOGNITO/PRIVATE mode for {gemail}")
+        
+        # Create driver with retries - ALWAYS INCOGNITO (ONLY ONCE)
+        driver_attempts = 0
+        max_driver_attempts = 3
+        while driver_attempts < max_driver_attempts:
+            try:
+                driver = create_chrome_driver(headless=False, profile_dir=None, max_retries=2)
+                try:
+                    _ = driver.current_url
+                    break
+                except:
+                    raise Exception("Driver not responsive")
+            except Exception as driver_error:
+                driver_attempts += 1
+                logging.warning(f"[{worker_id}] Driver creation attempt {driver_attempts} failed: {driver_error}")
+                if driver:
+                    try:
+                        shutdown_driver(driver)
+                    except:
+                        pass
+                    driver = None
+                if driver_attempts < max_driver_attempts:
+                    safe_sleep((3.0, 5.0))
+        else:
+            raise Exception(f"Failed to create driver after {max_driver_attempts} attempts: {driver_error}")
+
+        # Login to Instantly (ONLY ONCE)
+        update_status(gemail, "Logging in", workspace_status, "Logging into Instantly...")
+        print(f"[{worker_id}] Navigating to Instantly login...")
+        driver.get(INSTANTLY_URL)
+        safe_sleep((1.0, 1.5))
+    except Exception as setup_error:
+        logging.error(f"[{worker_id}] Failed to setup Chrome/navigation: {setup_error}")
+        if driver:
+            try:
+                shutdown_driver(driver)
+            except:
+                pass
+        update_status(gemail, "issue", workspace_status, f"Setup failed: {str(setup_error)[:200]}")
+        return False
+    
+    # ========== RETRY LOOP: Only retry from login onwards (NOT Chrome/navigation) ==========
+    while retry_count <= max_retries:
+        try:
+            if retry_count > 0:
+                logging.info(f"[{worker_id}] Retry attempt {retry_count} for {gemail} (already logged in, continuing from here)")
+                safe_sleep((3.0, 5.0))
+                # Check if we're still logged in, if not, navigate back
+                try:
+                    current_url = driver.current_url
+                    if "instantly.ai" not in current_url.lower():
+                        logging.info(f"[{worker_id}] Not on Instantly page, navigating back...")
+                        driver.get(INSTANTLY_URL)
+                        safe_sleep((2.0, 3.0))
+                except:
+                    logging.warning(f"[{worker_id}] Could not check current URL, navigating to Instantly...")
+                    driver.get(INSTANTLY_URL)
+                    safe_sleep((2.0, 3.0))
+
+            # Only login if not already logged in (check for "Add New" button)
+            try:
+                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, '//button[contains(., "Add New")]')))
+                logging.info(f"[{worker_id}] Already logged in, skipping login step")
+            except:
+                # Need to login
+                logging.info(f"[{worker_id}] Logging in to Instantly for {instantly_email}")
+                try:
+                    email_input = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='email']")))
+                    type_slowly(email_input, instantly_email, driver=driver)
+                    safe_sleep((0.2, 0.4))
+                except Exception as e:
+                    logging.error(f"[{worker_id}] Email input error: {e}")
+                    raise
+
+                try:
+                    password_input = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']")))
+                    type_slowly(password_input, instantly_password, driver=driver)
+                    safe_sleep((0.2, 0.4))
+                except Exception as e:
+                    logging.error(f"[{worker_id}] Password input error: {e}")
+                    raise
+
+                if not click_element_with_fallback(driver, By.CSS_SELECTOR, 'button[form="loginForm"]', timeout=15, retries=3):
+                    logging.warning(f"[{worker_id}] Login button not found, trying Enter key")
+                    try:
+                        password_input.send_keys(Keys.RETURN)
+                    except:
+                        pass
+
+                # Wait for page to load after login
+                WebDriverWait(driver, 60).until(EC.presence_of_element_located((By.XPATH, '//button[contains(., "Add New")]')))
+                safe_sleep((0.5, 1.0))
+                logging.info(f"[{worker_id}] Successfully logged into Instantly")
+                update_status(gemail, "Logged in", workspace_status, "Successfully logged into Instantly")
+            
+            # Quick wait after login check
+            safe_sleep((0.5, 0.8))
+            logging.info(f"[{worker_id}] Ready to proceed...")
+
+            # STEP 1: Select workspace FIRST (before Add New button)
+            if workspace and str(workspace).strip() and str(workspace).strip().lower() not in ['nan', 'none', '']:
+                update_status(gemail, "Selecting workspace", workspace_status, f"Selecting workspace '{workspace}'...")
+                logging.info(f"[{worker_id}] Attempting to select workspace '{workspace}' BEFORE clicking Add New")
+                workspace_status = select_workspace(driver, workspace, worker_id)
+                logging.info(f"[{worker_id}] Workspace '{workspace}' status: {workspace_status}")
+                
+                # Navigate back to accounts page after workspace click (ALWAYS)
+                update_status(gemail, "Processing", workspace_status, f"Navigating back to accounts page...")
+                try:
+                    driver.get(INSTANTLY_URL)
+                    safe_sleep((1.0, 1.5))
+                    logging.info(f"[{worker_id}] Navigated back to {INSTANTLY_URL}")
+                except Exception as nav_err:
+                    logging.warning(f"[{worker_id}] Navigation back failed: {nav_err}")
+                
+                # Update status after navigation
+                if workspace_status == 'selected':
+                    update_status(gemail, "Processing", workspace_status, f"Workspace '{workspace}' selected successfully")
+                elif workspace_status:
+                    update_status(gemail, "Processing", workspace_status, f"Workspace '{workspace}' {workspace_status}")
+            else:
+                logging.info(f"[{worker_id}] No workspace provided in sheet, skipping workspace selection")
+                workspace_status = 'skipped'
+                update_status(gemail, "Processing", workspace_status, "No workspace provided, skipping selection")
+
+            # STEP 2: Add Gmail account (AFTER workspace selection)
+            update_status(gemail, "Adding account", workspace_status, "Clicking Add New button...")
+            logging.info(f"[{worker_id}] Adding Gmail account {gemail}")
+            add_new_btn = '//button[contains(., "Add New")]'
+            if not click_element_with_fallback(driver, By.XPATH, add_new_btn, timeout=15, retries=5):
+                raise Exception("Failed to click 'Add New' button")
+            safe_sleep((0.3, 0.6))  # faster after Add New
+
+            # Handle trial limit popup
+            for attempt in range(3):
+                try:
+                    trial_xpath = '//div[contains(text(), "Trial limit reached")]'
+                    WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, trial_xpath)))
+                    logging.info(f"[{worker_id}] Trial limit popup detected")
+                    try:
+                        cancel = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "Cancel")]')))
+                        driver.execute_script("arguments[0].click();", cancel)
+                    except:
+                        driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+                    safe_sleep((0.5, 0.8))
+                    driver.refresh()
+                    safe_sleep((1.0, 1.5))
+                    click_element_with_fallback(driver, By.XPATH, add_new_btn, timeout=15, retries=3)
+                    safe_sleep((1.0, 1.5))
+                except TimeoutException:
+                    break
+
+            # Select Gmail option
+            update_status(gemail, "Selecting Gmail", workspace_status, "Selecting Gmail...")
+            gmail_option = "(//h6[text()='Gmail / G-Suite'])[2] | //div[contains(text(), 'Gmail') and contains(@class, 'MuiListItem-root')]"
+            if not click_element_with_fallback(driver, By.XPATH, gmail_option, timeout=10, retries=3):
+                raise Exception("Failed to click Gmail option")
+            safe_sleep((0.3, 0.5))
+
+            # Select oAuth option
+            update_status(gemail, "Selecting oAuth", workspace_status, "Selecting oAuth...")
+            oauth_option = '//div[h6[text()="Option 1: oAuth"] or contains(text(), "oAuth")]'
+            if not click_element_with_fallback(driver, By.XPATH, oauth_option, timeout=10, retries=3):
+                raise Exception("Failed to click oAuth option")
+            safe_sleep((0.3, 0.5))
+
+            # Click Login button
+            update_status(gemail, "Opening Google", workspace_status, "Opening Google OAuth...")
+            login_btn = '//button[h6[text()="Login"] or contains(text(), "Login")]'
+            if not click_element_with_fallback(driver, By.XPATH, login_btn, timeout=10, retries=3):
+                raise Exception("Failed to click Login button")
+            safe_sleep((0.5, 0.8))
+
+            # Switch to Google login window - wait for new window
+            original_window = driver.current_window_handle
+            all_windows = driver.window_handles
+            if len(all_windows) > 1:
+                for window in all_windows:
+                    if window != original_window:
+                        driver.switch_to.window(window)
+                        break
+            else:
+                # Wait for window to open
+                safe_sleep((1.0, 1.5))
+                all_windows = driver.window_handles
+                if len(all_windows) > 1:
+                    for window in all_windows:
+                        if window != original_window:
+                            driver.switch_to.window(window)
+                            break
+                else:
+                    logging.warning(f"[{worker_id}] No new window opened")
+            
+            safe_sleep((0.5, 1.0))
+            logging.info(f"[{worker_id}] Google login window: {driver.current_url}")
+            update_status(gemail, "Google OAuth", workspace_status, "Google login...")
+
+            # Handle "Use another account" if present
+            try:
+                another_account = '//div[text()="Use another account"]'
+                el = WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, another_account)))
+                driver.execute_script("arguments[0].click();", el)
+                safe_sleep((0.3, 0.5))
+            except:
+                pass
+
+            # Enter Gmail email
+            update_status(gemail, "Entering email", workspace_status, "Entering email...")
+            try:
+                email_input = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='email']")))
+                type_slowly(email_input, gemail, driver=driver)
+                safe_sleep((0.2, 0.3))
+                next_btn = "//button[.//span[text()='Next']]"
+                if not click_element_with_fallback(driver, By.XPATH, next_btn, timeout=8, retries=2):
+                    email_input.send_keys(Keys.RETURN)
+                safe_sleep((0.3, 0.5))
+            except Exception as e:
+                logging.error(f"[{worker_id}] Email input error: {e}")
+                raise
+
+            # Enter Gmail password
+            update_status(gemail, "Entering password", workspace_status, "Entering password...")
+            try:
+                password_input = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']")))
+                type_slowly(password_input, gpassword, driver=driver)
+                safe_sleep((0.2, 0.3))
+                next_btn = "//button[.//span[text()='Next']]"
+                if not click_element_with_fallback(driver, By.XPATH, next_btn, timeout=8, retries=2):
+                    password_input.send_keys(Keys.RETURN)
+                safe_sleep((0.3, 0.5))
+            except Exception as e:
+                logging.error(f"[{worker_id}] Password input error: {e}")
+                raise
+
+            # Handle recovery email if needed - FAST CHECK
+            print(f"[{worker_id}] Checking for recovery email...")
+            recovery_xpaths = [
+                "//div[contains(text(), 'Confirm your recovery email')]",
+                "//div[@class='l5PPKe' and contains(text(), 'Confirm your recovery email')]",
+                "//div[@jsname='fmcmS' and contains(text(), 'Confirm your recovery email')]",
+            ]
+            recovery_found = False
+            for xpath in recovery_xpaths:
+                try:
+                    recovery_el = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                    driver.execute_script("arguments[0].click();", recovery_el)
+                    recovery_found = True
+                    print(f"[{worker_id}] ✓ Recovery email prompt found")
+                    safe_sleep((0.3, 0.5))
+                    break
+                except:
+                    continue
+            
+            if recovery_found and recovery_email and str(recovery_email).strip() and str(recovery_email).strip().lower() not in ['nan', 'none', '']:
+                try:
+                    recovery_input = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email']")))
+                    type_slowly(recovery_input, str(recovery_email).strip(), driver=driver, delay_range=MEDIUM_DELAY)
+                    safe_sleep((0.2, 0.3))
+                    next_xpaths = ["//button[contains(., 'Next')]", "//button[@id='next']"]
+                    find_and_click_element(driver, next_xpaths, "Next", worker_id, timeout=5)
+                    safe_sleep((0.5, 0.8))
+                except:
+                    pass
+            elif not recovery_found:
+                print(f"[{worker_id}] ⏭ Recovery email not required")
+
+            # ============================= "I UNDERSTAND" - EXACT SELECTOR FROM SOURCE =============================
+            # Source: <input type="submit" class="MK9CEd MVpUfe" jsname="M2UYVd" name="confirm" value="I understand" id="confirm">
+            print(f"[{worker_id}] Checking for 'I understand' button...")
+            i_understand_found = False
+            i_understand_selectors = [
+                "//input[@id='confirm' and @value='I understand']",
+                "//input[@name='confirm' and @value='I understand']",
+                "//input[@type='submit' and @value='I understand']",
+                "//input[contains(@class, 'MK9CEd') and @value='I understand']",
+                "//input[@jsname='M2UYVd']",
+                "//input[@value='I understand']",
+                "//input[@value='Saya mengerti']",
+                "//*[contains(., 'I understand') and (self::button or self::input)]",
+            ]
+            for selector in i_understand_selectors:
+                try:
+                    el = driver.find_element(By.XPATH, selector)
+                    if el.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                        safe_sleep((0.1, 0.2))
+                        driver.execute_script("arguments[0].click();", el)
+                        i_understand_found = True
+                        print(f"[{worker_id}] ✓ Clicked 'I understand'")
+                        safe_sleep((0.2, 0.3))
+                        break
+                except:
+                    continue
+            if not i_understand_found:
+                print(f"[{worker_id}] ⏭ 'I understand' not present - skipping")
+
+            # ============================= CONTINUE BUTTON - EXACT SELECTOR FROM SOURCE =============================
+            # Source: <button class="VfPpkd-LgbsSe..." jsname="LgbsSe"><span class="VfPpkd-vQzf8d">Continue</span></button>
+            print(f"[{worker_id}] Looking for Continue button...")
+            continue_clicked = False
+            continue_selectors = [
+                "//button[@jsname='LgbsSe']//span[@class='VfPpkd-vQzf8d' and text()='Continue']/..",
+                "//button[contains(@class, 'VfPpkd-LgbsSe')]//span[text()='Continue']/..",
+                "//span[@jsname='V67aGc' and text()='Continue']/ancestor::button",
+                "//span[@class='VfPpkd-vQzf8d' and text()='Continue']/ancestor::button",
+                "//button[contains(@class, 'VfPpkd-LgbsSe') and .//span[text()='Continue']]",
+                "//button[@jsname='LgbsSe' and .//span[contains(text(), 'Continue')]]",
+                "//button[.//span[text()='Continue']]",
+                "//button[.//span[text()='Lanjutkan']]",
+                "//button[contains(., 'Continue')]",
+            ]
+            for selector in continue_selectors:
+                try:
+                    el = driver.find_element(By.XPATH, selector)
+                    if el.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                        safe_sleep((0.1, 0.2))
+                        driver.execute_script("arguments[0].click();", el)
+                        continue_clicked = True
+                        print(f"[{worker_id}] ✓ Clicked 'Continue'")
+                        safe_sleep((0.2, 0.3))
+                        break
+                except:
+                    continue
+            if not continue_clicked:
+                print(f"[{worker_id}] ⏭ Continue not present - proceeding to Allow")
+
+            # ============================= ALLOW BUTTON - EXACT SELECTOR FROM SOURCE (CRITICAL) =============================
+            # Source: <button class="VfPpkd-LgbsSe..." jsname="LgbsSe"><span class="VfPpkd-vQzf8d">Allow</span></button>
+            print(f"[{worker_id}] Looking for Allow button (REQUIRED)...")
+            allow_clicked = False
+            allow_selectors = [
+                "//button[@jsname='LgbsSe']//span[@class='VfPpkd-vQzf8d' and text()='Allow']/..",
+                "//button[contains(@class, 'VfPpkd-LgbsSe')]//span[text()='Allow']/..",
+                "//span[@jsname='V67aGc' and text()='Allow']/ancestor::button",
+                "//span[@class='VfPpkd-vQzf8d' and text()='Allow']/ancestor::button",
+                "//button[contains(@class, 'VfPpkd-LgbsSe') and .//span[text()='Allow']]",
+                "//button[@jsname='LgbsSe' and .//span[contains(text(), 'Allow')]]",
+                "//button[.//span[text()='Allow']]",
+                "//button[.//span[text()='Izinkan']]",
+                "//button[contains(., 'Allow')]",
+                "//button[contains(., 'Izinkan')]",
+            ]
+            
+            # Try 3 times to find and click Allow
+            for attempt in range(3):
+                for selector in allow_selectors:
+                    try:
+                        el = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                        if el.is_displayed():
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                            safe_sleep((0.1, 0.2))
+                            driver.execute_script("arguments[0].click();", el)
+                            allow_clicked = True
+                            print(f"[{worker_id}] ✓ Clicked 'Allow'")
+                            logging.info(f"[{worker_id}] Clicked Allow button successfully")
+                            break
+                    except:
+                        continue
+                if allow_clicked:
+                    break
+                safe_sleep((0.3, 0.5))
+
+            if not allow_clicked:
+                print(f"[{worker_id}] ✗ Allow button NOT clicked - marking failed")
+                update_status(gemail, "failed", workspace_status, "Allow button not clicked - OAuth permission denied")
+                raise Exception("Allow button not clicked - OAuth permission denied")
+
+            safe_sleep((0.5, 0.8))
+
+            # ============================= SUCCESS DETECTION - WAIT FOR "CONNECTED" ALERT =============================
+            print(f"[{worker_id}] ⏳ Waiting for success notification...")
+            logging.info(f"[{worker_id}] Waiting for success notification after Allow...")
+            
+            # Switch back to Instantly window first
+            all_windows = driver.window_handles
+            if len(all_windows) > 1:
+                for window in all_windows:
+                    driver.switch_to.window(window)
+                    try:
+                        if "instantly.ai" in driver.current_url.lower():
+                            logging.info(f"[{worker_id}] Switched back to Instantly window")
+                            break
+                    except:
+                        continue
+            
+            safe_sleep((0.5, 0.8))
+            
+            # Wait for success notification - FAST CHECK
+            max_success_wait = 30  # Reduced from 60 for speed
+            success_detected = False
+            success_notification_text = None
+            
+            for wait_count in range(max_success_wait):
+                try:
+                    page_source = driver.page_source.lower()
+                    
+                    # Check for success indicators
+                    success_keywords = ["connected", "success", "account added", "email added"]
+                    if any(kw in page_source for kw in success_keywords):
+                        # Quick DOM check for visible success notification
+                        success_xpaths = [
+                            '//*[contains(text(), "Connected")]',
+                            '//*[contains(text(), "connected")]',
+                            '//*[contains(text(), "Success")]',
+                            '//*[contains(text(), "success")]',
+                            '//div[contains(@class, "success")]',
+                            '//div[contains(@class, "alert")]',
+                            '//div[@role="status"]',
+                            '//div[contains(@class, "Toastify")]',
+                            '//div[contains(@class, "toast")]',
+                            '//div[contains(@class, "notification")]',
+                        ]
+                        for xpath in success_xpaths:
+                            try:
+                                elements = driver.find_elements(By.XPATH, xpath)
+                                for el in elements:
+                                    if el.is_displayed():
+                                        text = el.text.strip().lower()
+                                        if text and any(w in text for w in ["connected", "success", "added"]):
+                                            success_detected = True
+                                            success_notification_text = el.text.strip()
+                                            print(f"[{worker_id}] ✓✓✓ SUCCESS: {success_notification_text}")
+                                            break
+                                if success_detected:
+                                    break
+                            except:
+                                continue
+                        if success_detected:
+                            break
+                    
+                    # Check URL redirect to accounts page
+                    current_url = driver.current_url.lower()
+                    if "instantly.ai/app/accounts" in current_url:
+                        add_new_exists = len(driver.find_elements(By.XPATH, '//button[contains(., "Add New")]')) > 0
+                        if add_new_exists:
+                            success_detected = True
+                            success_notification_text = "Redirected to accounts page"
+                            print(f"[{worker_id}] ✓✓✓ SUCCESS: Redirected to accounts page")
+                            break
+                except:
+                    pass
+                
+                safe_sleep((0.5, 0.8))
+            
+            # ============================= FINAL STATUS UPDATE =============================
+            if success_detected:
+                safe_sleep((0.5, 0.8))
+                logging.info(f"[{worker_id}] ✓✓✓ FINAL SUCCESS: {gemail}")
+                print(f"[{worker_id}] ✓✓✓ FINAL SUCCESS: {gemail} - {success_notification_text}")
+                update_status(gemail, "success", workspace_status or "unselected", f"Connected! {success_notification_text}")
+                
+                if driver:
+                    try:
+                        shutdown_driver(driver)
+                        driver = None
+                    except:
+                        pass
+                return True
+            else:
+                logging.error(f"[{worker_id}] ✗ FAILED: {gemail} - Success notification not found")
+                print(f"[{worker_id}] ✗ FAILED: Success notification not found after {max_success_wait}s")
+                update_status(gemail, "failed", workspace_status or "unselected", f"Success not detected after Allow")
+                raise Exception("Success notification not found after Allow")
+
+        except Exception as e:
+            msg = str(e)[:200]
+            logging.error(f"[{worker_id}] Error for {gemail} (attempt {retry_count + 1}): {msg}")
+            
+            retryable_errors = ["timeout", "connection", "network", "element", "click", "load"]
+            if retry_count < max_retries and any(err in msg.lower() for err in retryable_errors):
+                retry_count += 1
+                logging.info(f"[{worker_id}] Retrying {gemail} due to retryable error (keeping Chrome open)...")
+                safe_sleep((3.0, 5.0))
+                continue
+            
+            # Only close driver on final failure (not on retry)
+            if driver:
+                try:
+                    shutdown_driver(driver)
+                    driver = None
+                except:
+                    pass
+            
+            update_status(gemail, "issue", workspace_status, msg)
+            return False
+    
+    # Final cleanup if max retries exceeded
+    if driver:
+        try:
+            shutdown_driver(driver)
+            driver = None
+        except:
+            pass
+    
+    update_status(gemail, "issue", workspace_status, "Max retries exceeded")
+    return False
+
+def select_workspace(driver, workspace_name, worker_id):
+    """
+    Simple popup-only workspace selection:
+    - Clicks the dropdown button (outlined button with SVG)
+    - Scrolls inside the popup list (simplebar)
+    - Clicks the workspace if found; otherwise returns 'unselected'
+    """
+    workspace_name_clean = str(workspace_name).strip()
+    logging.info(f"[{worker_id}] Starting workspace selection for '{workspace_name_clean}'")
+
+    print("Opening workspace dropdown...")
+    dropdown_btn = driver.find_element(By.XPATH, "//button[contains(@class,'MuiButton-outlined')]")
+    dropdown_btn.click()
+    safe_sleep((0.6, 0.9))  # faster after open
+    logging.info(f"[{worker_id}] Dropdown opened.")
+
+    # Scrollable area inside popup
+    scroll_area = driver.find_element(By.XPATH, "//div[@data-simplebar='init']//div[contains(@class,'simplebar-content-wrapper')]")
+
+    # Try to find and click workspace; scroll up to 30 times for speed
+    for attempt in range(30):
+        try:
+            workspace_element = driver.find_element(
+                By.XPATH,
+                f"//li[contains(@class,'MuiMenuItem-root')][normalize-space()='{workspace_name_clean}']"
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", workspace_element)
+            safe_sleep((0.2, 0.35))
+            workspace_element.click()
+            logging.info(f"[{worker_id}] Clicked workspace: {workspace_name_clean}")
+            safe_sleep((0.6, 0.9))
+            return 'selected'
+        except Exception:
+            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 300;", scroll_area)
+            safe_sleep((0.2, 0.35))
+
+    logging.warning(f"[{worker_id}] Workspace '{workspace_name_clean}' NOT FOUND after scrolling popup.")
+    return 'unselected'
+
+# ============================= BATCH RUNNER =============================
+def main():
+    try:
+        print("="*60)
+        print("INSTANTLY AUTOMATION STARTED")
+        print("Chrome will open in INCOGNITO/PRIVATE mode")
+        print("="*60)
+        
+        # Ensure DISPLAY is set for VM
+        if not os.environ.get('DISPLAY'):
+            os.environ['DISPLAY'] = ':0'
+            print(f"Set DISPLAY={os.environ['DISPLAY']} for VM")
+            logging.info(f"Set DISPLAY={os.environ['DISPLAY']} for VM")
+        
+        logging.info("Instantly automation started - Chrome in INCOGNITO mode")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"DISPLAY: {os.environ.get('DISPLAY', 'NOT SET')}")
+        
+        try:
+            df = pd.read_csv(GOOGLE_SHEET_CSV_URL, dtype=str).dropna(how='all')
+            logging.info(f"Successfully loaded CSV from Google Sheet: {len(df)} rows")
+        except Exception as csv_error:
+            logging.error(f"Failed to load CSV from Google Sheet: {csv_error}")
+            print(f"ERROR: Failed to load CSV: {csv_error}")
+            raise
+        
+        max_workers = 15
+
+        accounts = []
+        for _, r in df.iterrows():
+            # Helper function to safely get and strip values, handling NaN
+            def safe_get_strip(key, default=''):
+                if key not in r:
+                    return default
+                val = r.get(key, default)
+                if pd.isna(val) or val is None:
+                    return default
+                return str(val).strip()
+            
+            gemail = safe_get_strip('gemail')
+            gpassword = safe_get_strip('gpassword')
+            instantly_email = safe_get_strip('instantly_email')
+            instantly_password = safe_get_strip('instantly_password')
+            workspace = safe_get_strip('workspace')
+            recovery_email = safe_get_strip('Recovery email')
+            
+            if all([gemail, gpassword, instantly_email, instantly_password]):
+                accounts.append({
+                    'gemail': gemail,
+                    'gpassword': gpassword,
+                    'instantly_email': instantly_email,
+                    'instantly_password': instantly_password,
+                    'workspace': workspace,
+                    'recovery_email': recovery_email
+                })
+
+        if not accounts:
+            print("No accounts found!")
+            return
+
+        total_accounts = len(accounts)
+        print(f"Starting processing {total_accounts} accounts (max_parallel_browsers={max_workers})")
+        successes = 0
+        failed_accounts = []
+
+        effective_workers = min(max_workers, total_accounts)
+        print(f"Running with {effective_workers} parallel workers...")
+
+        spawn_ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=effective_workers, mp_context=spawn_ctx) as executor:
+            future_map = {}
+            
+            for idx, acc in enumerate(accounts, start=1):
+                worker_id = f"W{idx:02d}"
+                if idx > 1:
+                    time.sleep(random.uniform(0.3, 0.8))
+                
+                print(f"[{idx}/{total_accounts}] Submitting {acc['gemail']}")
+                future = executor.submit(
+                    process_single_account,
+                    acc['gemail'],
+                    acc['gpassword'],
+                    acc['instantly_email'],
+                    acc['instantly_password'],
+                    acc['workspace'],
+                    acc['recovery_email'],
+                    worker_id
+                )
+                future_map[future] = (idx, acc['gemail'])
+
+            completed = 0
+            for future in as_completed(future_map):
+                idx, gemail = future_map[future]
+                completed += 1
+                try:
+                    ok = future.result(timeout=600)
+                except Exception as exc:
+                    logging.error(f"[Worker {idx}] Error for {gemail}: {exc}")
+                    ok = False
+                    failed_accounts.append(gemail)
+                
+                if ok:
+                    successes += 1
+                    result_label = "✓ Success"
+                else:
+                    result_label = "✗ Failed"
+                    failed_accounts.append(gemail)
+                
+                print(f"[{completed}/{total_accounts}] {result_label}: {gemail}")
+                
+                if completed % 5 == 0:
+                    success_rate = (successes / completed) * 100
+                    print(f"Progress: {completed}/{total_accounts} | Success Rate: {success_rate:.1f}% | Successes: {successes}")
+
+        success_rate = (successes / total_accounts) * 100 if total_accounts > 0 else 0
+        print(f"\n{'='*60}")
+        print(f"FINAL RESULTS:")
+        print(f"Total Accounts: {total_accounts}")
+        print(f"Successful: {successes}")
+        print(f"Failed: {len(failed_accounts)}")
+        print(f"Success Rate: {success_rate:.2f}%")
+        if failed_accounts:
+            print(f"\nFailed Accounts: {', '.join(failed_accounts[:10])}{'...' if len(failed_accounts) > 10 else ''}")
+        print(f"{'='*60}")
+    
+    except Exception as main_error:
+        logging.error(f"Error in main function: {main_error}", exc_info=True)
+        print(f"ERROR in main: {main_error}")
+        raise
+
+if __name__ == "__main__":
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("Script interrupted by user")
+        print("\nScript interrupted by user")
+        exit(0)
+    except Exception as e:
+        logging.error(f"Fatal error in main: {e}", exc_info=True)
+        print(f"\nFATAL ERROR: {e}")
+        print("Check instantly_automation.log for details")
+        exit(1) 
